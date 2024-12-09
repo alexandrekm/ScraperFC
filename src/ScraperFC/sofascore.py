@@ -93,11 +93,11 @@ class Sofascore:
             Available seasons for the league. {season string: season ID, ...}
         """
         if not isinstance(league, str):
-            raise TypeError('`league` must be a string.')
-        if league not in comps.keys():
-            raise InvalidLeagueException(league, 'Sofascore', list(comps.keys()))
+            raise TypeError('`league` must be an str.')
+        # if league not in comps.keys():
+        #     raise InvalidLeagueException(league, 'Sofascore', list(comps.keys()))
             
-        response = botasaurus_get(f'{API_PREFIX}/unique-tournament/{comps[league]}/seasons/')
+        response = botasaurus_get(f'{API_PREFIX}/unique-tournament/{league}/seasons/')
         seasons = dict([(x['year'], x['id']) for x in response.json()['seasons']])
         return seasons
 
@@ -109,7 +109,7 @@ class Sofascore:
         ----------
         year : str
             See the :ref:`sofascore_year` `year` parameter docs for details.
-        league : str
+        league : int
             League to get valid seasons for. See comps ScraperFC.Sofascore for valid leagues.
         
         Returns
@@ -118,21 +118,23 @@ class Sofascore:
             Each element being a single game of the competition
         """
         if not isinstance(year, str):
-            raise TypeError('`year` must be a string.')
-        valid_seasons = self.get_valid_seasons(league)
-        if year not in valid_seasons.keys():
-            raise InvalidYearException(year, league, list(valid_seasons.keys()))
+            raise TypeError('`year` must be an str.')
+        # valid_seasons = self.get_valid_seasons(league)
+        # if year not in valid_seasons.keys():
+        #     raise InvalidYearException(year, league, list(valid_seasons.keys()))
+        valid_seasons = {year: 58766}
 
         matches = list()
         i = 0
         while 1:
             response = botasaurus_get(
-                f'{API_PREFIX}/unique-tournament/{comps[league]}/season/{valid_seasons[year]}/' +
+                f'{API_PREFIX}/unique-tournament/{league}/season/{valid_seasons[year]}/' +
                 f'events/last/{i}'
             )
             if response.status_code != 200:
                 break
             matches += response.json()['events']
+            break
             i += 1
 
         return matches
@@ -349,7 +351,7 @@ class Sofascore:
         ----------
         match : str or int
             Sofascore match URL or match ID
-
+        
         Returns
         --------
         : DataFrame
@@ -534,3 +536,66 @@ class Sofascore:
             )
             df = pd.DataFrame()
         return df
+
+    # ==============================================================================================
+    def scrape_match_odds(self, match: Union[str, int]) -> pd.DataFrame:
+        """ Get odds data for a specific match from Sofascore API.
+
+        Parameters
+        ----------
+        match : str or int
+            Either a Sofascore match URL or match ID.
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame containing the odds data with columns:
+            - marketId: ID of the betting market
+            - marketName: Name of the betting market (e.g., 'Full time', 'Double chance')
+            - choiceGroup: Group for the choice if applicable (e.g., '2.5' for Over/Under)
+            - name: Name of the betting selection
+            - initialOdds: Initial fractional odds
+            - currentOdds: Current fractional odds
+            - winning: Boolean indicating if the selection won
+            - change: Change in odds direction (-1 for shortened, 1 for drifted, 0 for unchanged)
+        """
+        match_id = self._check_and_convert_to_match_id(match)
+        response = botasaurus_get(f'{API_PREFIX}/event/{match_id}/odds/1/all')
+        
+        if response.status_code != 200:
+            return pd.DataFrame()
+            
+        data = response.json()
+        
+        # Create list to store odds data
+        odds_data = []
+        
+        # Process each market
+        for market in data.get('markets', []):
+            market_id = market.get('marketId')
+            market_name = market.get('marketName')
+            choice_group = market.get('choiceGroup', '')
+            
+            # Process each choice in the market
+            for choice in market.get('choices', []):
+                odds_data.append({
+                    'marketId': market_id,
+                    'marketName': market_name,
+                    'choiceGroup': choice_group,
+                    'name': choice.get('name'),
+                    'initialOdds': choice.get('initialFractionalValue'),
+                    'currentOdds': choice.get('fractionalValue'),
+                    'winning': choice.get('winning', None),
+                    'change': choice.get('change')
+                })
+        
+        # Create DataFrame
+        df = pd.DataFrame(odds_data)
+        
+        # Sort by marketId and name for consistent ordering
+        if not df.empty:
+            df = df.sort_values(['marketId', 'name'])
+            
+        return df
+
+    # ==============================================================================================
