@@ -2,8 +2,10 @@ import pandas as pd
 from .scraperfc_exceptions import InvalidLeagueException, InvalidYearException
 from .utils import botasaurus_get
 import numpy as np
-from typing import Union, Sequence
-import warnings
+from typing import Union, Sequence, Optional
+from datetime import timedelta
+from .cache_manager import CacheManager
+from .utils.logger_config import setup_logging
 
 """ These are the status codes for Sofascore events. Found in event['status'] key.
 {100: {'code': 100, 'description': 'Ended', 'type': 'finished'},
@@ -20,29 +22,14 @@ import warnings
 
 API_PREFIX = 'https://api.sofascore.com/api/v1'
 
-comps = {
-    # European continental club comps
-    'Champions League': 7, 'Europa League': 679, 'Europa Conference League': 17015,
-    # European domestic leagues
-    'EPL': 17, 'La Liga': 8, 'Bundesliga': 35, 'Serie A': 23, 'Ligue 1': 34,
-    # South America
-    'Argentina Liga Profesional': 155, 'Argentina Copa de la Liga Profesional': 13475,
-    'Liga 1 Peru': 406, "Copa Libertadores": 384,
-    # USA
-    'MLS': 242, 'USL Championship': 13363, 'USL1': 13362, 'USL2': 13546,
-    # Middle East
-    "Saudi Pro League": 955,
-    # Men's international comps
-    'World Cup': 16, 'Euros': 1, 'Gold Cup': 140,
-    # Women's international comps
-    "Women's World Cup": 290
-}
-
-
 class Sofascore:
     
     # ==============================================================================================
-    def __init__(self) -> None:
+    def __init__(self, log_file: str = "scraperfc.log") -> None:
+        self.log_file = log_file
+        self.logger = setup_logging(__name__)
+        self.logger.debug("Initializing Sofascore scraper with log file: {}", log_file)
+        self.cache_manager = CacheManager()
         self.league_stats_fields = [
             'goals', 'yellowCards', 'redCards', 'groundDuelsWon', 'groundDuelsWonPercentage',
             'aerialDuelsWon', 'aerialDuelsWonPercentage', 'successfulDribbles',
@@ -79,13 +66,36 @@ class Sofascore:
         return match_id
 
     # ==============================================================================================
-    def get_valid_seasons(self, league: str) -> dict:
+    def _is_match_finished(self, match_id: Union[str, int]) -> bool:
+        """Helper function to check if a match is finished.
+        
+        This function first checks the cache to see if the match is finished.
+        If the match is not in the cache or not finished, it returns False.
+        
+        Parameters
+        ----------
+        match_id : str or int
+            Match ID to check
+            
+        Returns
+        -------
+        bool
+            True if match is finished, False otherwise
+        """
+        match_id = str(match_id)  # Convert to string since cache manager expects string
+        self.logger.debug(f"Checking if match {match_id} is finished")
+        return self.cache_manager.is_match_finished(match_id)
+
+    # ==============================================================================================
+    def get_valid_seasons(self, league: str, use_cache: bool = True) -> dict:
         """ Returns the valid seasons and their IDs for the given league
 
         Parameters
         ----------
         league : str
             League to get valid seasons for. See comps ScraperFC.Sofascore for valid leagues.
+        use_cache : bool, optional
+            Whether to use cached data if available. Defaults to True.
         
         Returns
         -------
@@ -94,15 +104,25 @@ class Sofascore:
         """
         if not isinstance(league, str):
             raise TypeError('`league` must be an str.')
-        # if league not in comps.keys():
-        #     raise InvalidLeagueException(league, 'Sofascore', list(comps.keys()))
+            
+        if use_cache:
+            cached_data = self.cache_manager.get_valid_seasons(league, timedelta(days=30))  # 1 month cache
+            if cached_data:
+                return cached_data
             
         response = botasaurus_get(f'{API_PREFIX}/unique-tournament/{league}/seasons/')
-        seasons = dict([(x['year'], x['id']) for x in response.json()['seasons']])
+        if response and response.status_code == 200:
+            seasons = dict([(x['year'], x['id']) for x in response.json()['seasons']])
+        else:
+            raise ValueError(f"Failed to get valid seasons for {league}")
+        
+        if use_cache:
+            self.cache_manager.save_valid_seasons(league, seasons, url=f'{API_PREFIX}/unique-tournament/{league}/seasons/')
+            
         return seasons
 
     # ==============================================================================================
-    def get_match_dicts(self, year: str, league:str) -> Sequence[dict]:
+    def get_match_dicts(self, year: str, league: str, use_cache: bool = True) -> Sequence[dict]:
         """ Returns the matches from the Sofascore API for a given league season.
 
         Parameters
@@ -111,30 +131,56 @@ class Sofascore:
             See the :ref:`sofascore_year` `year` parameter docs for details.
         league : int
             League to get valid seasons for. See comps ScraperFC.Sofascore for valid leagues.
+        use_cache : bool, optional
+            Whether to use cached data if available. Defaults to True.
         
         Returns
         -------
         matches : list of dict
             Each element being a single game of the competition
         """
+        self.logger.info(f"Sofascore.get_match_dicts: Getting matches")
         if not isinstance(year, str):
             raise TypeError('`year` must be an str.')
-        # valid_seasons = self.get_valid_seasons(league)
-        # if year not in valid_seasons.keys():
-        #     raise InvalidYearException(year, league, list(valid_seasons.keys()))
-        valid_seasons = {year: 58766}
+            
+        valid_seasons = self.get_valid_seasons(league)
+        if year not in valid_seasons.keys():
+            raise InvalidYearException(year, league, list(valid_seasons.keys()))
 
         matches = list()
         i = 0
         while 1:
+            cached_data = None
+            if use_cache:
+                cached_data = self.cache_manager.get_match_dicts(league, year, i, timedelta(days=1))
+            
+            if cached_data is not None:
+                if isinstance(cached_data, list) and len(cached_data) == 0:  # If we previously got a 404
+                    self.logger.debug(f"Found empty cache for page {i}, stopping pagination")
+                    break
+                matches += cached_data
+                i += 1
+                continue
+
             response = botasaurus_get(
                 f'{API_PREFIX}/unique-tournament/{league}/season/{valid_seasons[year]}/' +
                 f'events/last/{i}'
             )
-            if response.status_code != 200:
+            
+            if response.status_code == 404:
+                self.logger.warning(f"Got 404 for page {i}, saving empty cache")
+                if use_cache:
+                    self.cache_manager.save_match_dicts(league, year, i, [], timedelta(days=1), 
+                        url=f'{API_PREFIX}/unique-tournament/{league}/season/{valid_seasons[year]}/events/last/{i}')
                 break
-            matches += response.json()['events']
-            break
+            elif response.status_code == 200:
+                page_data = response.json()['events']
+                matches += page_data
+                if use_cache:
+                    self.cache_manager.save_match_dicts(league, year, i, page_data, url=f'{API_PREFIX}/unique-tournament/{league}/season/{valid_seasons[year]}/events/last/{i}')
+            else:
+                self.logger.error(f"Got unexpected status code {response.status_code}")
+                break
             i += 1
 
         return matches
@@ -179,13 +225,15 @@ class Sofascore:
             f"{match_dict['awayTeam']['slug']}/{match_dict['customId']}#id:{match_dict['id']}"
 
     # ==============================================================================================
-    def get_match_dict(self, match: Union[str, int]) -> dict:
+    def get_match_dict(self, match: Union[str, int], use_cache: bool = True) -> dict:
         """ Get match data dict for a single match
 
         Parameters
         ----------
         match : str or int
             Sofascore match URL or match ID
+        use_cache : bool, optional
+            Whether to use cached data if available. Defaults to True.
 
         Returns
         -------
@@ -193,8 +241,21 @@ class Sofascore:
             Generic data about a match
         """
         match_id = self._check_and_convert_to_match_id(match)
+        
+        if use_cache:
+            cached_data = self.cache_manager.get_match_dict(str(match_id))  # Forever cache
+            if cached_data:
+                return cached_data
+
         response = botasaurus_get(f'{API_PREFIX}/event/{match_id}')
-        data = response.json()['event']
+        if response and response.status_code == 200:
+            data = response.json()['event']
+        else:
+            raise ValueError(f"Failed to get match data for ID {match_id}")
+        
+        if use_cache:
+            self.cache_manager.save_match_dict(str(match_id), data, url=f'{API_PREFIX}/event/{match_id}')
+            
         return data
 
     # ==============================================================================================
@@ -217,38 +278,54 @@ class Sofascore:
         return home_team, away_team
     
     # ==============================================================================================
-    def get_positions(self, selected_positions: Sequence[str]) -> str:
+    def get_positions(self, selected_positions: Sequence[str], use_cache: bool = True) -> str:
         """ Returns a string for the parameter filters of the scrape_league_stats() request.
 
         Parameters
         ----------
         selected_positions : list of str
             List of the positions available to filter on the SofaScore UI
-
+        use_cache : bool, optional
+            Whether to use cached data if available. Defaults to True.
+        
         Returns
         -------
         : str
             Joined abbreviations for the chosen positions
         """
-        positions = {'Goalkeepers': 'G', 'Defenders': 'D', 'Midfielders': 'M', 'Forwards': 'F'}
         if not isinstance(selected_positions, list):
             raise TypeError('`selected_positions` must be a list.')
         if not np.all([isinstance(x, str) for x in selected_positions]):
             raise TypeError('All items in `selected_positions` must be strings.')
+            
+        if use_cache:
+            selected_positions_key = '_'.join(sorted(selected_positions))
+            cached_data = self.cache_manager.get_positions(selected_positions_key, timedelta(days=90))  # 3 months cache
+            if cached_data:
+                return cached_data
+
+        positions = {'Goalkeepers': 'G', 'Defenders': 'D', 'Midfielders': 'M', 'Forwards': 'F'}
         if not np.isin(selected_positions, list(positions.keys())).all():
             raise ValueError(f'All items in `selected_positions` must be in {positions.keys()}')
             
         abbreviations = [positions[position] for position in selected_positions]
-        return '~'.join(abbreviations)
-    
+        result = '~'.join(abbreviations)
+        
+        if use_cache:
+            self.cache_manager.save_positions(selected_positions_key, result, url=None)  # No URL since this is computed locally
+            
+        return result
+
     # ==============================================================================================
-    def get_player_ids(self, match: Union[str, int]) -> dict:
+    def get_player_ids(self, match: Union[str, int], use_cache: bool = True) -> dict:
         """ Get the player IDs for a match
         
         Parameters
         ----------
         match : str or int
             Sofascore match URL or match ID
+        use_cache : bool, optional
+            Whether to use cached data if available. Defaults to True.
 
         Returns
         -------
@@ -256,22 +333,35 @@ class Sofascore:
             Name and ID of every player in the match, {name: id, ...}
         """
         match_id = self._check_and_convert_to_match_id(match)
+        
+        if use_cache:
+            cached_data = self.cache_manager.get_player_ids(str(match_id))  # Forever cache
+            if cached_data:
+                return cached_data
+                
         url = f"{API_PREFIX}/event/{match_id}/lineups"
         response = botasaurus_get(url)
-        teams = ['home', 'away']
-        if response.status_code == 200:
-            player_ids = dict()
-            for team in teams:
-                data = response.json()[team]['players']
-                for item in data:
-                    player_data = item['player']
-                    player_ids[player_data['name']] = player_data['id']
-        else:
-            warnings.warn(f"\nReturned {response.status_code} from {url}. Returning empty dict.")
-            player_ids = dict()
+        
+        if response and response.status_code == 200:
+            home_players = response.json()['home']['players']
+            away_players = response.json()['away']['players']
+            for p in home_players:
+                p["teamId"] = response.json()['home']['teamId']
+                p["teamName"] = response.json()['home']['name']
+            for p in away_players:
+                p["teamId"] = response.json()['away']['teamId']
+                p["teamName"] = response.json()['away']['name']
+                players = home_players + away_players
+                
+            temp = pd.DataFrame(players)
+            data = dict(zip(temp['name'], temp['id']))
+            
+            if use_cache:
+                self.cache_manager.save_player_ids(str(match_id), data, url=f"{API_PREFIX}/event/{match_id}/lineups")
+                
+            return data
+        return {}
 
-        return player_ids
-    
     # ==============================================================================================
     def scrape_player_league_stats(
             self, year: str, league: str, accumulation: str='total',
@@ -324,7 +414,8 @@ class Sofascore:
                 f'&fields={self.concatenated_fields}' +\
                 f'&filters=position.in.{positions}'
             response = botasaurus_get(request_url)
-            results += response.json()['results']
+            if response and response.status_code == 200:
+                results += response.json()['results']
             if (response.json()['page'] == response.json()['pages']) or\
                     (response.json()['pages'] == 0):
                 break
@@ -361,42 +452,95 @@ class Sofascore:
         match_id = self._check_and_convert_to_match_id(match)
         url = f'{API_PREFIX}/event/{match_id}/graph'
         response = botasaurus_get(url)
-        if response.status_code == 200:
+        if response and response.status_code == 200:
             match_momentum_df = pd.DataFrame(response.json()['graphPoints'])
         else:
-            warnings.warn(f"\nReturned {response.status_code} from {url}. Returning empty dataframe.")
+            self.logger.warning(f"Returned {response.status_code} from {url}. Returning empty dataframe.")
             match_momentum_df = pd.DataFrame()
 
         return match_momentum_df
 
     # ==============================================================================================
-    def scrape_team_match_stats(self, match: Union[str, int]) -> pd.DataFrame:
+    def scrape_team_match_stats(self, match: Union[str, int], use_cache: bool = True) -> pd.DataFrame:
         """ Scrape team stats for a match
 
         Parameters
         ----------
         match : str or int
             Sofascore match URL or match ID
+        use_cache : bool, optional
+            Whether to use cached data if available. Defaults to True.
+            For finished matches, data is cached forever.
 
         Returns
         -------
         : DataFrame
         """
         match_id = self._check_and_convert_to_match_id(match)
+        self.get_match_dict(match_id)
+        
+        if use_cache:
+            cached_data = self.cache_manager.get_match_stats(str(match_id))  # Forever cache
+            if cached_data is not None:  # Check for None specifically as empty list is valid
+                self.logger.debug(f"Processing statistics for match {match_id}")
+                
+                df = pd.DataFrame()
+                stats = cached_data
+                
+                if isinstance(stats, dict) and 'statistics' in stats:
+                    stats = stats['statistics']
+                
+                for period in stats:
+                    period_name = period['period']
+                    
+                    for group in period['groups']:
+                        group_name = group['groupName']
+                        temp = pd.DataFrame.from_dict(group['statisticsItems'])
+                        temp['period'] = period_name
+                        temp['group'] = group_name
+                        df = pd.concat([df, temp], ignore_index=True)
+                
+                self.logger.debug(f"Successfully processed statistics for match {match_id}")
+                return df
+
         url = f'{API_PREFIX}/event/{match_id}/statistics'
-        response = botasaurus_get(url)
-        if response.status_code == 200:
-            df = pd.DataFrame()
-            for period in response.json()['statistics']:
-                period_name = period['period']
-                for group in period['groups']:
-                    group_name = group['groupName']
-                    temp = pd.DataFrame.from_dict(group['statisticsItems'])
-                    temp['period'] = [period_name,] * temp.shape[0]
-                    temp['group'] = [group_name,] * temp.shape[0]
-                    df = pd.concat([df, temp], ignore_index=True)
-        else:
-            warnings.warn(f"\nReturned {response.status_code} from {url}. Returning empty dataframe.")
+        try:
+            response = botasaurus_get(url)
+            if response and response.status_code == 200:
+                df = pd.DataFrame()
+                data = response.json()['statistics']
+                
+                # Cache if the match is finished
+                if use_cache:
+                    if self._is_match_finished(match_id):
+                        self.cache_manager.save_match_stats(str(match_id), data, url=f'{API_PREFIX}/event/{match_id}/statistics')
+                
+                for period in data:
+                    period_name = period['period']
+                    self.logger.debug(f"Processing period: {period_name}")
+                    
+                    for group in period['groups']:
+                        group_name = group['groupName']
+                        self.logger.debug(f"Processing group: {group_name}")
+                        
+                        if 'statisticsItems' in group:
+                            temp = pd.DataFrame.from_dict(group['statisticsItems'])
+                            temp['period'] = period_name
+                            temp['group'] = group_name
+                            df = pd.concat([df, temp], ignore_index=True)
+                        else:
+                            self.logger.warning(f"No statisticsItems found in group {group_name}")
+                
+                self.logger.debug(f"Successfully processed statistics for match {match_id}")
+            elif response.status_code == 404:
+                self.logger.error("HTTP 404 error from {}: Match {} not found", url, match_id)
+                df = pd.DataFrame()
+                self.cache_manager.save_match_stats(str(match_id), [], timedelta(days=1), url=f'{API_PREFIX}/event/{match_id}/statistics')
+            else:
+                self.logger.error("HTTP {} error from {}: Failed to retrieve match {} statistics", response.status_code, url, match_id)
+                df = pd.DataFrame()
+        except Exception as e:
+            self.logger.error("Error processing match {}: {}", match_id, str(e))
             df = pd.DataFrame()
         
         return df
@@ -419,7 +563,7 @@ class Sofascore:
         url = f'{API_PREFIX}/event/{match_id}/lineups'
         response = botasaurus_get(url)
         
-        if response.status_code == 200:
+        if response and response.status_code == 200:
             home_players = response.json()['home']['players']
             away_players = response.json()['away']['players']
             for p in home_players:
@@ -441,7 +585,7 @@ class Sofascore:
                     columns.append(temp[c])  # type: ignore
             df = pd.concat(columns, axis=1)
         else:
-            warnings.warn(f"\nReturned {response.status_code} from {url}. Returning empty dataframe.")
+            self.logger.warning(f"Returned {response.status_code} from {url}. Returning empty dataframe.")
             df = pd.DataFrame()
         
         return df
@@ -465,7 +609,7 @@ class Sofascore:
         home_name, away_name = self.get_team_names(match)
         url = f'{API_PREFIX}/event/{match_id}/average-positions'
         response = botasaurus_get(url)
-        if response.status_code == 200:
+        if response and response.status_code == 200:
             df = pd.DataFrame()
             for key, name in [('home', home_name), ('away', away_name)]:
                 temp = pd.DataFrame(response.json()[key])
@@ -476,7 +620,7 @@ class Sofascore:
                 )
                 df = pd.concat([df, temp], axis=0, ignore_index=True)
         else:
-            warnings.warn(f"\nReturned {response.status_code} from {url}. Returning empty dataframe.")
+            self.logger.warning(f"Returned {response.status_code} from {url}. Returning empty dataframe.")
             df = pd.DataFrame()
         return df
     
@@ -503,7 +647,7 @@ class Sofascore:
             player_id = players[player]
             url = f'{API_PREFIX}/event/{match_id}/player/{player_id}/heatmap'
             response = botasaurus_get(url)
-            if response.status_code == 200:
+            if response and response.status_code == 200:
                 heatmap = [(z['x'], z['y']) for z in response.json()['heatmap']]
             else:
                 # Players that didn't play have empty heatmaps. Don't print warning because there
@@ -528,23 +672,23 @@ class Sofascore:
         match_id = self._check_and_convert_to_match_id(match)
         url = f"{API_PREFIX}/event/{match_id}/shotmap"
         response = botasaurus_get(url)
-        if response.status_code == 200:
+        if response and response.status_code == 200:
             df = pd.DataFrame.from_dict(response.json()["shotmap"])
         else:
-            warnings.warn(
-                f"Returned {response.status_code} from {url}. Returning empty dataframe."
-            )
+            self.logger.warning(f"Returned {response.status_code} from {url}. Returning empty dataframe.")
             df = pd.DataFrame()
         return df
 
     # ==============================================================================================
-    def scrape_match_odds(self, match: Union[str, int]) -> pd.DataFrame:
-        """ Get odds data for a specific match from Sofascore API.
+    def scrape_match_odds(self, match: Union[str, int], use_cache: bool = True) -> pd.DataFrame:
+        """Get odds data for a specific match from Sofascore API.
 
         Parameters
         ----------
         match : str or int
             Either a Sofascore match URL or match ID.
+        use_cache : bool, optional
+            Whether to use cached data if available. Defaults to True.
 
         Returns
         -------
@@ -554,48 +698,91 @@ class Sofascore:
             - marketName: Name of the betting market (e.g., 'Full time', 'Double chance')
             - choiceGroup: Group for the choice if applicable (e.g., '2.5' for Over/Under)
             - name: Name of the betting selection
-            - initialOdds: Initial fractional odds
-            - currentOdds: Current fractional odds
+            - initialOdds: Initial odds value
+            - initialFractionalValue: Initial fractional odds value
+            - currentOdds: Current odds value
             - winning: Boolean indicating if the selection won
-            - change: Change in odds direction (-1 for shortened, 1 for drifted, 0 for unchanged)
         """
         match_id = self._check_and_convert_to_match_id(match)
-        response = botasaurus_get(f'{API_PREFIX}/event/{match_id}/odds/1/all')
         
-        if response.status_code != 200:
+        if use_cache:
+            # First check if match is finished
+            is_finished = self._is_match_finished(match_id)
+            
+            # For finished matches, check cache without duration
+            if is_finished:
+                cached_data = self.cache_manager.get_match_odds(str(match_id))
+                if cached_data is not None:
+                    # Extract the markets from the nested data structure
+                    if isinstance(cached_data, dict) and 'data' in cached_data:
+                        cached_data = cached_data['data']
+                    return self._process_odds_data(cached_data)
+            else:
+                # For unfinished matches, check cache with 1-day duration
+                cached_data = self.cache_manager.get_match_odds(str(match_id), timedelta(days=1))
+                if cached_data is not None:
+                    # Extract the markets from the nested data structure
+                    if isinstance(cached_data, dict) and 'data' in cached_data:
+                        cached_data = cached_data['data']
+                    return self._process_odds_data(cached_data)
+        
+        self.logger.info(f"Fetching odds data for match {match_id}")
+        url = f'{API_PREFIX}/event/{match_id}/odds/1/all'
+        response = botasaurus_get(url)
+        
+        if not response or response.status_code >= 300:
+            status_code = response.status_code if response else 'No response'
+            self.logger.warning(f"Failed to get odds data for match ID {match_id} with status {status_code}")
+            if use_cache:
+                if is_finished:
+                    self.cache_manager.save_match_odds(str(match_id), [], url=url)  # Cache forever for finished matches
+                else:
+                    self.cache_manager.save_match_odds(str(match_id), [], timedelta(days=1), url=url)
             return pd.DataFrame()
             
         data = response.json()
+
+        # Cache the raw data
+        if use_cache:
+            if is_finished:
+                self.cache_manager.save_match_odds(str(match_id), data, url=url)  # Cache forever for finished matches
+            else:
+                self.cache_manager.save_match_odds(str(match_id), data, timedelta(days=1), url=url)
         
-        # Create list to store odds data
+        return self._process_odds_data(data)
+
+    def _process_odds_data(self, data: dict) -> pd.DataFrame:
+        """Process the odds data into a DataFrame.
+        
+        Parameters
+        ----------
+        data : dict
+            Raw odds data from the API or cache
+            
+        Returns
+        -------
+        pd.DataFrame
+            Basic DataFrame with odds data
+        """
         odds_data = []
         
         # Process each market
         for market in data.get('markets', []):
             market_id = market.get('marketId')
             market_name = market.get('marketName')
-            choice_group = market.get('choiceGroup', '')
+            choice_group = market.get('choiceGroup')  # Get choiceGroup from market level
             
-            # Process each choice in the market
             for choice in market.get('choices', []):
-                odds_data.append({
+                choice_data = {
                     'marketId': market_id,
                     'marketName': market_name,
-                    'choiceGroup': choice_group,
+                    'choiceGroup': choice_group,  # Use market-level choiceGroup
                     'name': choice.get('name'),
-                    'initialOdds': choice.get('initialFractionalValue'),
-                    'currentOdds': choice.get('fractionalValue'),
-                    'winning': choice.get('winning', None),
-                    'change': choice.get('change')
-                })
+                    'initialOdds': choice.get('initialOdds'),
+                    'initialFractionalValue': choice.get('initialFractionalValue'),
+                    'currentOdds': choice.get('currentOdds', choice.get('fractionalValue')),  # Use fractionalValue as fallback
+                    'winning': choice.get('winning')
+                }
+                odds_data.append(choice_data)
         
-        # Create DataFrame
-        df = pd.DataFrame(odds_data)
-        
-        # Sort by marketId and name for consistent ordering
-        if not df.empty:
-            df = df.sort_values(['marketId', 'name'])
-            
-        return df
-
-    # ==============================================================================================
+        return pd.DataFrame(odds_data)
