@@ -735,9 +735,9 @@ class Sofascore:
             self.logger.warning(f"Failed to get odds data for match ID {match_id} with status {status_code}")
             if use_cache:
                 if is_finished:
-                    self.cache_manager.save_match_odds(str(match_id), [], url=url)  # Cache forever for finished matches
+                    self.cache_manager.save_match_odds(str(match_id), {"markets": []}, url=url)  # Cache forever for finished matches
                 else:
-                    self.cache_manager.save_match_odds(str(match_id), [], timedelta(days=1), url=url)
+                    self.cache_manager.save_match_odds(str(match_id), {"markets": []}, timedelta(days=1), url=url)
             return pd.DataFrame()
             
         data = response.json()
@@ -766,6 +766,11 @@ class Sofascore:
         """
         odds_data = []
         
+        # Handle case where data is a list or None
+        if not data or isinstance(data, list) or not isinstance(data, dict):
+            self.logger.warning("Received invalid odds data format")
+            return pd.DataFrame()
+            
         # Process each market
         for market in data.get('markets', []):
             market_id = market.get('marketId')
