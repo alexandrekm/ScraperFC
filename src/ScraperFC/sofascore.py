@@ -20,6 +20,7 @@ from .utils.logger_config import setup_logging
  0: {'code': 0, 'description': 'Not started', 'type': 'notstarted'}}
 """
 
+
 API_PREFIX = 'https://api.sofascore.com/api/v1'
 
 class Sofascore:
